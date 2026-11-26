@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Home as HomeIcon,
   Package,
@@ -447,6 +447,22 @@ export default function CampusKart() {
     [loadItems]
   );
 
+  const deleteItem = useCallback(
+    async (it) => {
+      try {
+        await sbFetch(`items?id=eq.${encodeURIComponent(it.id)}`, { method: "DELETE" });
+        await loadItems();
+        showToast("Listing deleted.");
+        return true;
+      } catch (e) {
+        console.error("deleteItem failed", e);
+        showToast("Couldn't delete the listing. Check your internet and try again.");
+        return false;
+      }
+    },
+    [loadItems, showToast]
+  );
+
   const promoteToAdmin = useCallback(async (mobile) => {
     const u = await storageGet(`users:${mobile}`, true);
     if (!u) {
@@ -541,7 +557,12 @@ export default function CampusKart() {
           <MyItemsTab
             user={user}
             items={items.filter((i) => i.sellerMobile === user.mobile)}
+            allItems={items}
             persistItem={persistItem}
+            persistUser={persistUser}
+            showToast={showToast}
+            submitReport={submitReport}
+            onDelete={deleteItem}
           />
         )}
         {tab === "chats" && (
@@ -837,8 +858,9 @@ function BrowseScreen({ user, items, onBack, onOpenItem }) {
   if (scope) {
     visible = items.filter(
       (i) =>
-        (i.status !== "sold" || i.sellerMobile === user.mobile) &&
-        (!i.blocked || i.sellerMobile === user.mobile || user.isAdmin)
+        i.sellerMobile !== user.mobile && // your own listings live in the "My Items" tab
+        i.status !== "sold" &&
+        (!i.blocked || user.isAdmin)
     );
     if (scope === "college") visible = visible.filter((i) => i.college === user.college);
     else if (scope === "district") visible = visible.filter((i) => i.district === user.district);
@@ -924,13 +946,17 @@ function ItemCard({ item, onClick }) {
 
 /* ---------------- Add item form ---------------- */
 
-function AddItemForm({ user, onCancel, onSaved }) {
-  const [name, setName] = useState("");
-  const [price, setPrice] = useState("");
-  const [category, setCategory] = useState(CATEGORIES[0]);
-  const [colour, setColour] = useState("");
-  const [description, setDescription] = useState("");
-  const [photos, setPhotos] = useState([]);
+function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
+  const isEdit = !!existing;
+  const newId = useRef(uid()); // one id per form, so a double tap re-saves the SAME row instead of adding a second one
+  const [saving, setSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [name, setName] = useState(existing ? existing.name : "");
+  const [price, setPrice] = useState(existing ? String(existing.price) : "");
+  const [category, setCategory] = useState(existing ? existing.category : CATEGORIES[0]);
+  const [colour, setColour] = useState(existing ? existing.colour || "" : "");
+  const [description, setDescription] = useState(existing ? existing.description || "" : "");
+  const [photos, setPhotos] = useState(existing ? existing.photos || [] : []);
   const [error, setError] = useState("");
   const [presets, setPresets] = useState([]);
   const [presetPick, setPresetPick] = useState("");
@@ -963,7 +989,8 @@ function AddItemForm({ user, onCancel, onSaved }) {
     });
   }
 
-  function submit() {
+  async function submit() {
+    if (saving) return;
     if (!name.trim() || !price) {
       setError("Fill in item name and price.");
       return;
@@ -972,8 +999,18 @@ function AddItemForm({ user, onCancel, onSaved }) {
       setError("Description should be about 100 words or less.");
       return;
     }
-    const item = {
-      id: uid(),
+    const item = isEdit
+      ? {
+          ...existing,
+          name: name.trim(),
+          price: Number(price),
+          category,
+          colour: category === "Dresses & Clothing" ? colour : "",
+          description: description.trim(),
+          photos: photos.filter(Boolean),
+        }
+      : {
+      id: newId.current,
       sellerMobile: user.mobile,
       name: name.trim(),
       price: Number(price),
@@ -991,14 +1028,20 @@ function AddItemForm({ user, onCancel, onSaved }) {
       exchangeConfirmed: {},
       createdAt: Date.now(),
     };
-    onSaved(item);
+    setError("");
+    setSaving(true);
+    try {
+      await onSaved(item);
+    } finally {
+      setSaving(false);
+    }
   }
 
   const activePreset = presetPick !== "" ? presets[Number(presetPick)] : null;
 
   return (
     <div>
-      <ScreenHeader title="Add item" onBack={onCancel} />
+      <ScreenHeader title={isEdit ? "Edit item" : "Add item"} onBack={onCancel} />
       <div style={S.formPhotoRow}>
         {[0, 1].map((i) => (
           <label key={i} style={S.photoSlot}>
@@ -1017,7 +1060,7 @@ function AddItemForm({ user, onCancel, onSaved }) {
         ))}
       </div>
 
-      {presets.length > 0 && (
+      {!isEdit && presets.length > 0 && (
         <FormField label={`Common items for ${user.college}`}>
           <select style={S.input} value={presetPick} onChange={(e) => applyPreset(e.target.value)}>
             <option value="">Type my own item instead</option>
@@ -1070,9 +1113,41 @@ function AddItemForm({ user, onCancel, onSaved }) {
       </FormField>
 
       {error && <div style={S.error}>{error}</div>}
-      <button style={S.primaryBtn} onClick={submit}>
-        List item
+      <button style={{ ...S.primaryBtn, opacity: saving ? 0.6 : 1 }} onClick={submit} disabled={saving}>
+        {saving ? "Saving..." : isEdit ? "Save changes" : "List item"}
       </button>
+
+      {isEdit && onDelete && (
+        <div style={{ marginTop: 14 }}>
+          {!confirmDelete ? (
+            <button style={S.linkDanger} onClick={() => setConfirmDelete(true)}>
+              Delete this listing
+            </button>
+          ) : (
+            <div style={S.reportBox}>
+              <div style={{ fontSize: 13, marginBottom: 8 }}>
+                Delete "{existing.name}" permanently? This can't be undone.
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  style={S.dangerBtn}
+                  disabled={saving}
+                  onClick={async () => {
+                    setSaving(true);
+                    await onDelete(existing);
+                    setSaving(false);
+                  }}
+                >
+                  Yes, delete
+                </button>
+                <button style={S.ghostBtn} onClick={() => setConfirmDelete(false)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1151,6 +1226,7 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
   }
 
   async function initiateBuy() {
+    if (isOwner) return; // you can't reserve your own item
     const next = { ...local, buyerMobile: user.mobile, status: "reserved" };
     setLocal(next);
     await persistItem(next);
@@ -1274,7 +1350,13 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
         </div>
       )}
 
-      {(local.buyerMobile === user.mobile || isOwner) && (
+      {isOwner && !local.buyerMobile && (
+        <div style={S.emptyState}>
+          No buyer yet. Students from your college and district can see this listing, and chat opens here once someone reserves it.
+        </div>
+      )}
+
+      {((isBuyer && !isOwner) || (isOwner && local.buyerMobile && local.buyerMobile !== user.mobile)) && (
         <div style={S.chatBox}>
           <div style={S.chatHeader}>
             <MessageCircle size={14} style={{ marginRight: 6 }} />
@@ -1334,15 +1416,58 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
 
 /* ---------------- My items tab ---------------- */
 
-function MyItemsTab({ items }) {
+function MyItemsTab({ user, items, allItems, persistItem, persistUser, showToast, submitReport, onDelete }) {
+  const [openId, setOpenId] = useState(null);
+  const current = openId ? items.find((i) => i.id === openId) : null;
+
+  if (current && current.status === "active") {
+    return (
+      <AddItemForm
+        user={user}
+        existing={current}
+        onCancel={() => setOpenId(null)}
+        onSaved={async (item) => {
+          await persistItem(item);
+          showToast("Changes saved.");
+          setOpenId(null);
+        }}
+        onDelete={async (item) => {
+          const ok = await onDelete(item);
+          if (ok) setOpenId(null);
+        }}
+      />
+    );
+  }
+
+  if (current) {
+    // reserved or sold: no editing (a buyer is already involved), show the deal/chat instead
+    return (
+      <ItemDetail
+        item={current}
+        user={user}
+        allItems={allItems}
+        onBack={() => setOpenId(null)}
+        persistItem={persistItem}
+        persistUser={persistUser}
+        showToast={showToast}
+        submitReport={submitReport}
+      />
+    );
+  }
+
   return (
     <div>
       <div style={S.sectionTitle}>My listings</div>
       {items.length === 0 && (
         <div style={S.emptyState}>You haven't listed anything yet.</div>
       )}
+      {items.length > 0 && (
+        <div style={{ fontSize: 12.5, color: "#9AA6C0", marginBottom: 8 }}>
+          Tap a listing to edit it. Once someone reserves it, it opens as a deal instead.
+        </div>
+      )}
       {items.map((item) => (
-        <ItemCard key={item.id} item={item} onClick={() => {}} />
+        <ItemCard key={item.id} item={item} onClick={() => setOpenId(item.id)} />
       ))}
     </div>
   );
@@ -1387,6 +1512,8 @@ function ChatsTab({ user, items, view, setView, persistItem, persistUser, showTo
     .filter(
       (i) =>
         (i.sellerMobile === user.mobile || i.buyerMobile === user.mobile) &&
+        i.buyerMobile &&
+        i.buyerMobile !== i.sellerMobile &&
         i.chat &&
         i.chat.length > 0
     )

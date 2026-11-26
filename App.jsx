@@ -109,8 +109,8 @@ const ADMIN_MOBILE = "9999999999";
 // Replace with the UPI ID that should receive optional "support this project"
 // contributions. There's no per-transaction fee anywhere in the app — buyers
 // and sellers settle item payments directly between themselves (cash or UPI).
-const SUPPORT_UPI_ID = "campuskart@upi";
-const SUPPORT_UPI_NAME = "CampusKart";
+const SUPPORT_UPI_ID = "9354002982@upi";
+const SUPPORT_UPI_NAME = "Vansh Pabreja";
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 

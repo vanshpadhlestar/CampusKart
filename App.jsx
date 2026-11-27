@@ -363,6 +363,105 @@ function computeAvgReplyTime(sellerMobile, allItems) {
   return `~${Math.round(mins / 60)} hr`;
 }
 
+/* ---- light-weight item helpers: no photos, so they are small and fast ---- */
+const ITEM_LIGHT_COLS =
+  "id,seller_mobile,buyer_mobile,name,price,category,colour,state,district,college,description,status,chat,exchange_confirmed,blocked,created_at";
+
+async function fetchItemsLight() {
+  const rows = await sbFetch(`items?select=${ITEM_LIGHT_COLS}`);
+  return (rows || []).map(toCamelObj);
+}
+
+async function fetchItemLive(id) {
+  try {
+    const rows = await sbFetch(`items?id=eq.${encodeURIComponent(id)}&select=${ITEM_LIGHT_COLS}`);
+    return rows && rows[0] ? toCamelObj(rows[0]) : null;
+  } catch (e) {
+    console.error("fetchItemLive failed", e);
+    return null;
+  }
+}
+
+// Save only the given fields of one item (so photos are not re-uploaded each time)
+async function patchItemFields(id, fields) {
+  await sbFetch(`items?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify(toSnakeObj(fields)),
+  });
+}
+
+async function deleteItemRow(id) {
+  await sbFetch(`items?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+}
+
+const STATUS_RANK = { active: 0, reserved: 1, sold: 2 };
+function mergeChats(a = [], b = []) {
+  const seen = new Set();
+  const out = [];
+  [...a, ...b].forEach((m) => {
+    const k = `${m.from}|${m.ts}|${m.text}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(m);
+    }
+  });
+  return out.sort((x, y) => x.ts - y.ts);
+}
+// a = what this device has, b = fresher data from the database
+function mergeItem(a, b) {
+  if (!b) return a;
+  const status = (STATUS_RANK[a.status] || 0) > (STATUS_RANK[b.status] || 0) ? a.status : b.status;
+  return {
+    ...a,
+    ...b,
+    photos: b.photos !== undefined ? b.photos : a.photos,
+    status,
+    chat: mergeChats(a.chat, b.chat),
+    exchangeConfirmed: { ...(b.exchangeConfirmed || {}), ...(a.exchangeConfirmed || {}) },
+    buyerMobile: b.buyerMobile || a.buyerMobile || null,
+  };
+}
+const lightSig = (i) =>
+  JSON.stringify([i.name, i.price, i.category, i.colour, i.description, i.status, i.buyerMobile, i.blocked, i.chat, i.exchangeConfirmed]);
+
+// Shrink a phone photo before saving (keeps the app fast)
+function resizeImage(file, maxSide = 800, quality = 0.72) {
+  return new Promise((resolve) => {
+    const fallback = () => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => resolve(null);
+      r.readAsDataURL(file);
+    };
+    try {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        fallback();
+      };
+      img.src = url;
+    } catch (e) {
+      fallback();
+    }
+  });
+}
+
 function fileToDataURL(file) {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -383,6 +482,15 @@ function useFonts() {
     link.href =
       "https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=Work+Sans:wght@400;500;600&display=swap";
     document.head.appendChild(link);
+    const st = document.createElement("style");
+    st.id = "campuskart-base-css";
+    st.textContent =
+      "html,body,#root{height:100%;margin:0;background:#06080F;}" +
+      "body{-webkit-text-size-adjust:100%;overscroll-behavior:none;}" +
+      "input,select,textarea{font-size:16px !important;}" +
+      "img{max-width:100%;}" +
+      "*{-webkit-tap-highlight-color:transparent;}";
+    document.head.appendChild(st);
   }, []);
 }
 
@@ -402,13 +510,27 @@ export default function CampusKart() {
     setTimeout(() => setToast(null), 2200);
   }, []);
 
+  const itemsRef = useRef([]);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  // Adds the demo listings only if some are missing. One quick check, then one bulk save.
   const seedIfEmpty = useCallback(async () => {
-    const demo = demoItemSeed();
-    for (const it of demo) {
-      const existing = await storageGet(`items:${it.id}`, true);
-      if (!existing) {
-        await storageSet(`items:${it.id}`, it, true);
-      }
+    try {
+      const have = await sbFetch("items?select=id&id=like.demo-*");
+      const haveIds = new Set((have || []).map((r) => r.id));
+      const missing = demoItemSeed().filter((it) => !haveIds.has(it.id));
+      if (missing.length === 0) return false;
+      await sbFetch("items", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(missing.map(toSnakeObj)),
+      });
+      return true;
+    } catch (e) {
+      console.error("seed failed", e);
+      return false;
     }
   }, []);
 
@@ -428,40 +550,85 @@ export default function CampusKart() {
           setUser(u);
         }
       }
-      await seedIfEmpty();
-      await loadItems();
+      // show the app quickly using the small (no photo) list, then fill in photos
+      try {
+        const light = await fetchItemsLight();
+        light.sort((a, b) => b.createdAt - a.createdAt);
+        setItems(light);
+      } catch (e) {
+        console.error(e);
+      }
       setBooting(false);
+      const seeded = await seedIfEmpty();
+      await loadItems();
+      if (seeded) console.log("demo items added");
     })();
   }, [loadItems, seedIfEmpty]);
+
+  // Live updates: every few seconds check for new messages, reservations, new items.
+  useEffect(() => {
+    if (!user) return undefined;
+    let stop = false;
+    let busy = false;
+    const tick = async () => {
+      if (busy || document.hidden) return;
+      busy = true;
+      try {
+        const light = await fetchItemsLight();
+        if (stop || !light) return;
+        const cur = itemsRef.current;
+        const map = new Map(cur.map((i) => [i.id, i]));
+        if (light.some((l) => !map.has(l.id))) {
+          await loadItems();
+          return;
+        }
+        const lightMap = new Map(light.map((l) => [l.id, l]));
+        let changed = cur.some((i) => !lightMap.has(i.id));
+        if (!changed) changed = light.some((l) => lightSig(map.get(l.id)) !== lightSig(l));
+        if (changed) {
+          setItems((prev) => prev.filter((i) => lightMap.has(i.id)).map((i) => mergeItem(i, lightMap.get(i.id))));
+        }
+      } catch (e) {
+        console.error("poll failed", e);
+      } finally {
+        busy = false;
+      }
+    };
+    const id = setInterval(tick, 4000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [user, loadItems]);
 
   const persistUser = useCallback(async (u) => {
     setUser(u);
     await storageSet(`users:${u.mobile}`, u, true);
   }, []);
 
-  const persistItem = useCallback(
-    async (it) => {
-      await storageSet(`items:${it.id}`, it, true);
-      await loadItems();
-    },
-    [loadItems]
-  );
+  // persistItem(item)            -> save the whole item (new item, or edit with photos)
+  // persistItem(item, {fields})  -> save only those fields (chat, status, block ...)
+  const persistItem = useCallback(async (it, fields) => {
+    setItems((prev) => {
+      const exists = prev.some((x) => x.id === it.id);
+      return exists ? prev.map((x) => (x.id === it.id ? { ...x, ...it } : x)) : [it, ...prev];
+    });
+    try {
+      if (fields) await patchItemFields(it.id, fields);
+      else await storageSet(`items:${it.id}`, it, true);
+    } catch (e) {
+      console.error("persistItem failed", e);
+    }
+  }, []);
 
-  const deleteItem = useCallback(
-    async (it) => {
-      try {
-        await sbFetch(`items?id=eq.${encodeURIComponent(it.id)}`, { method: "DELETE" });
-        await loadItems();
-        showToast("Listing deleted.");
-        return true;
-      } catch (e) {
-        console.error("deleteItem failed", e);
-        showToast("Couldn't delete the listing. Check your internet and try again.");
-        return false;
-      }
-    },
-    [loadItems, showToast]
-  );
+  const deleteItem = useCallback(async (id) => {
+    setItems((prev) => prev.filter((x) => x.id !== id));
+    try {
+      await deleteItemRow(id);
+    } catch (e) {
+      console.error("delete failed", e);
+    }
+  }, []);
 
   const promoteToAdmin = useCallback(async (mobile) => {
     const u = await storageGet(`users:${mobile}`, true);
@@ -558,11 +725,12 @@ export default function CampusKart() {
             user={user}
             items={items.filter((i) => i.sellerMobile === user.mobile)}
             allItems={items}
+            view={view}
+            setView={setView}
             persistItem={persistItem}
             persistUser={persistUser}
             showToast={showToast}
             submitReport={submitReport}
-            onDelete={deleteItem}
           />
         )}
         {tab === "chats" && (
@@ -592,6 +760,7 @@ export default function CampusKart() {
             persistUser={persistUser}
             items={items}
             persistItem={persistItem}
+            deleteItem={deleteItem}
             promoteToAdmin={promoteToAdmin}
             showToast={showToast}
             onLogout={handleLogout}
@@ -754,10 +923,6 @@ function TabBar({ tab, setTab }) {
 
 /* ---------------- Home tab (browse / search / add / detail) ---------------- */
 
-const SCOPES = [
-  { key: "college", label: "My college" },
-  { key: "district", label: "Nearest to me" },
-];
 
 function HomeTab({ user, items, view, setView, addItemToIndex, persistItem, persistUser, showToast, submitReport }) {
   if (view.name === "add") {
@@ -851,64 +1016,35 @@ function HomeTab({ user, items, view, setView, addItemToIndex, persistItem, pers
 /* ---------------- Browse screen (scope, then name search, then results) ---------------- */
 
 function BrowseScreen({ user, items, onBack, onOpenItem }) {
-  const [scope, setScope] = useState(null); // 'college' | 'district'
   const [query, setQuery] = useState("");
 
-  let visible = [];
-  if (scope) {
-    visible = items.filter(
-      (i) =>
-        i.sellerMobile !== user.mobile && // your own listings live in the "My Items" tab
-        i.status !== "sold" &&
-        (!i.blocked || user.isAdmin)
-    );
-    if (scope === "college") visible = visible.filter((i) => i.college === user.college);
-    else if (scope === "district") visible = visible.filter((i) => i.district === user.district);
-    if (query) {
-      visible = visible.filter((i) => i.name.toLowerCase().includes(query.toLowerCase()));
-    }
-  }
+  const visible = items.filter(
+    (i) =>
+      i.sellerMobile !== user.mobile &&
+      i.status !== "sold" &&
+      (!i.blocked || user.isAdmin) &&
+      (!query || i.name.toLowerCase().includes(query.toLowerCase()))
+  );
 
   return (
     <div>
       <ScreenHeader title="Browse" onBack={onBack} />
-
-      <div style={{ fontSize: 12.5, color: "#9AA6C0", marginBottom: 8 }}>
-        See items from...
-      </div>
-      <div style={S.rowGap}>
-        {SCOPES.map((s) => (
-          <button
-            key={s.key}
-            style={scope === s.key ? S.chipActive : S.chip}
-            onClick={() => setScope(s.key)}
-          >
-            {s.label}
-          </button>
+      <input
+        style={S.input}
+        placeholder="Search by item name..."
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+      />
+      <div style={{ marginTop: 4 }}>
+        {visible.length === 0 && (
+          <div style={S.emptyState}>
+            {query ? "No items match your search." : "Nothing listed yet."}
+          </div>
+        )}
+        {visible.map((item) => (
+          <ItemCard key={item.id} item={item} onClick={() => onOpenItem(item)} />
         ))}
       </div>
-
-      {scope && (
-        <input
-          style={{ ...S.input, marginTop: 14 }}
-          placeholder="Search by item name (optional)..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-      )}
-
-      {scope && (
-        <div style={{ marginTop: 8 }}>
-          {visible.length === 0 && (
-            <div style={S.emptyState}>Nothing listed in this scope yet.</div>
-          )}
-          {visible
-            .sort((a, b) => scoreSeller(b) - scoreSeller(a))
-            .map((item) => (
-              <ItemCard key={item.id} item={item} onClick={() => onOpenItem(item)} />
-            ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -946,17 +1082,16 @@ function ItemCard({ item, onClick }) {
 
 /* ---------------- Add item form ---------------- */
 
-function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
-  const isEdit = !!existing;
-  const newId = useRef(uid()); // one id per form, so a double tap re-saves the SAME row instead of adding a second one
+function AddItemForm({ user, onCancel, onSaved, initial }) {
+  const isEdit = !!initial;
+  const savingRef = useRef(false);
   const [saving, setSaving] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const [name, setName] = useState(existing ? existing.name : "");
-  const [price, setPrice] = useState(existing ? String(existing.price) : "");
-  const [category, setCategory] = useState(existing ? existing.category : CATEGORIES[0]);
-  const [colour, setColour] = useState(existing ? existing.colour || "" : "");
-  const [description, setDescription] = useState(existing ? existing.description || "" : "");
-  const [photos, setPhotos] = useState(existing ? existing.photos || [] : []);
+  const [name, setName] = useState(initial ? initial.name : "");
+  const [price, setPrice] = useState(initial ? String(initial.price) : "");
+  const [category, setCategory] = useState(initial ? initial.category : CATEGORIES[0]);
+  const [colour, setColour] = useState(initial ? initial.colour || "" : "");
+  const [description, setDescription] = useState(initial ? initial.description || "" : "");
+  const [photos, setPhotos] = useState(initial ? initial.photos || [] : []);
   const [error, setError] = useState("");
   const [presets, setPresets] = useState([]);
   const [presetPick, setPresetPick] = useState("");
@@ -981,7 +1116,8 @@ function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
   async function handlePhoto(e, index) {
     const file = e.target.files[0];
     if (!file) return;
-    const dataUrl = await fileToDataURL(file);
+    const dataUrl = await resizeImage(file);
+    if (!dataUrl) return;
     setPhotos((p) => {
       const next = [...p];
       next[index] = dataUrl;
@@ -990,7 +1126,7 @@ function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
   }
 
   async function submit() {
-    if (saving) return;
+    if (savingRef.current) return; // ignore a second tap while saving
     if (!name.trim() || !price) {
       setError("Fill in item name and price.");
       return;
@@ -999,40 +1135,39 @@ function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
       setError("Description should be about 100 words or less.");
       return;
     }
-    const item = isEdit
-      ? {
-          ...existing,
-          name: name.trim(),
-          price: Number(price),
-          category,
-          colour: category === "Dresses & Clothing" ? colour : "",
-          description: description.trim(),
-          photos: photos.filter(Boolean),
-        }
-      : {
-      id: newId.current,
-      sellerMobile: user.mobile,
+    setError("");
+    const fields = {
       name: name.trim(),
       price: Number(price),
       category,
       colour: category === "Dresses & Clothing" ? colour : "",
-      state: user.state,
-      district: user.district,
-      college: user.college,
       description: description.trim(),
       photos: photos.filter(Boolean),
-      status: "active",
-      blocked: false,
-      buyerMobile: null,
-      chat: [],
-      exchangeConfirmed: {},
-      createdAt: Date.now(),
     };
-    setError("");
+    const item = isEdit
+      ? { ...initial, ...fields }
+      : {
+          id: uid(),
+          sellerMobile: user.mobile,
+          ...fields,
+          state: user.state,
+          district: user.district,
+          college: user.college,
+          status: "active",
+          blocked: false,
+          buyerMobile: null,
+          chat: [],
+          exchangeConfirmed: {},
+          createdAt: Date.now(),
+        };
+    savingRef.current = true;
     setSaving(true);
     try {
       await onSaved(item);
-    } finally {
+    } catch (e) {
+      console.error(e);
+      setError("Could not save. Please try again.");
+      savingRef.current = false;
       setSaving(false);
     }
   }
@@ -1060,7 +1195,7 @@ function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
         ))}
       </div>
 
-      {!isEdit && presets.length > 0 && (
+      {presets.length > 0 && (
         <FormField label={`Common items for ${user.college}`}>
           <select style={S.input} value={presetPick} onChange={(e) => applyPreset(e.target.value)}>
             <option value="">Type my own item instead</option>
@@ -1113,41 +1248,13 @@ function AddItemForm({ user, onCancel, onSaved, onDelete, existing }) {
       </FormField>
 
       {error && <div style={S.error}>{error}</div>}
-      <button style={{ ...S.primaryBtn, opacity: saving ? 0.6 : 1 }} onClick={submit} disabled={saving}>
+      <button
+        style={{ ...S.primaryBtn, opacity: saving ? 0.6 : 1 }}
+        onClick={submit}
+        disabled={saving}
+      >
         {saving ? "Saving..." : isEdit ? "Save changes" : "List item"}
       </button>
-
-      {isEdit && onDelete && (
-        <div style={{ marginTop: 14 }}>
-          {!confirmDelete ? (
-            <button style={S.linkDanger} onClick={() => setConfirmDelete(true)}>
-              Delete this listing
-            </button>
-          ) : (
-            <div style={S.reportBox}>
-              <div style={{ fontSize: 13, marginBottom: 8 }}>
-                Delete "{existing.name}" permanently? This can't be undone.
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button
-                  style={S.dangerBtn}
-                  disabled={saving}
-                  onClick={async () => {
-                    setSaving(true);
-                    await onDelete(existing);
-                    setSaving(false);
-                  }}
-                >
-                  Yes, delete
-                </button>
-                <button style={S.ghostBtn} onClick={() => setConfirmDelete(false)}>
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -1181,7 +1288,14 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
   const [showReport, setShowReport] = useState(false);
   const [reportReason, setReportReason] = useState("");
   const [showRating, setShowRating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [ratingDone, setRatingDone] = useState(false);
   const isOwner = local.sellerMobile === user.mobile;
+
+  // keep this screen in step with new messages / status coming from the other person
+  useEffect(() => {
+    setLocal((prev) => mergeItem(prev, item));
+  }, [item]);
   const isBuyer = local.buyerMobile === user.mobile;
 
   useEffect(() => {
@@ -1206,63 +1320,110 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
   async function rateSeller(stars) {
     const seller = await storageGet(`users:${local.sellerMobile}`, true);
     if (seller) {
-      seller.ratings = [...(seller.ratings || []), { from: user.mobile, stars, ts: Date.now() }];
+      seller.ratings = [...(seller.ratings || []), { from: user.mobile, stars, ts: Date.now(), itemId: local.id }];
       await storageSet(`users:${seller.mobile}`, seller, true);
       setSellerUser(seller);
     }
     setShowRating(false);
+    setRatingDone(true);
     showToast("Thanks for rating the seller.");
   }
 
   async function sendMessage() {
     if (!message.trim()) return;
-    const next = {
-      ...local,
-      chat: [...(local.chat || []), { from: user.mobile, text: message.trim(), ts: Date.now() }],
-    };
-    setLocal(next);
+    const msg = { from: user.mobile, text: message.trim(), ts: Date.now() };
     setMessage("");
-    await persistItem(next);
+    setLocal((prev) => ({ ...prev, chat: [...(prev.chat || []), msg] }));
+    // merge with what the other person may have written in the meantime
+    const fresh = await fetchItemLive(local.id);
+    const merged = mergeItem({ ...local, chat: [...(local.chat || []), msg] }, fresh);
+    setLocal(merged);
+    await persistItem(merged, { chat: merged.chat });
+  }
+
+  async function openEdit() {
+    if (local.photos === undefined) {
+      const full = await storageGet(`items:${local.id}`, true);
+      setLocal((l) => ({ ...l, photos: (full && full.photos) || [] }));
+    }
+    setEditing(true);
   }
 
   async function initiateBuy() {
     if (isOwner) return; // you can't reserve your own item
+    const fresh = await fetchItemLive(local.id);
+    if (fresh && fresh.buyerMobile && fresh.buyerMobile !== user.mobile) {
+      setLocal((prev) => mergeItem(prev, fresh));
+      showToast("Sorry, someone else just reserved this item.");
+      return;
+    }
     const next = { ...local, buyerMobile: user.mobile, status: "reserved" };
     setLocal(next);
-    await persistItem(next);
+    await persistItem(next, { buyerMobile: next.buyerMobile, status: next.status });
     showToast("Marked as reserved — chat with the seller to arrange payment and pickup.");
   }
 
   const [showSupportQr, setShowSupportQr] = useState(false);
 
   async function confirmExchange() {
-    const confirmed = { ...(local.exchangeConfirmed || {}), [user.mobile]: true };
-    const bothConfirmed = confirmed[local.buyerMobile] && confirmed[local.sellerMobile];
+    // always start from the latest data, so we know if the other person has already confirmed
+    const fresh = await fetchItemLive(local.id);
+    const base = mergeItem(local, fresh);
+    const confirmed = { ...(base.exchangeConfirmed || {}), [user.mobile]: true };
+    const bothConfirmed = !!(base.buyerMobile && confirmed[base.buyerMobile] && confirmed[base.sellerMobile]);
     const next = {
-      ...local,
+      ...base,
       exchangeConfirmed: confirmed,
-      status: bothConfirmed ? "sold" : local.status,
+      status: bothConfirmed ? "sold" : base.status,
     };
     setLocal(next);
-    await persistItem(next);
+    await persistItem(next, { exchangeConfirmed: next.exchangeConfirmed, status: next.status });
 
     if (!bothConfirmed) {
       showToast(`Marked as exchanged on your side — waiting for the ${isOwner ? "buyer" : "seller"} to confirm too.`);
       return;
     }
 
-    const seller = await storageGet(`users:${local.sellerMobile}`, true);
+    const seller = await storageGet(`users:${base.sellerMobile}`, true);
     if (seller) {
       seller.sold = (seller.sold || 0) + 1;
       await storageSet(`users:${seller.mobile}`, seller, true);
+      if (seller.mobile === user.mobile) persistUser({ ...user, sold: seller.sold });
     }
     if (isBuyer) {
-      const buyerUser = { ...user, bought: (user.bought || 0) + 1 };
-      await persistUser(buyerUser);
-      setShowRating(true);
+      await persistUser({ ...user, bought: (user.bought || 0) + 1 });
+    } else {
+      const buyerRow = await storageGet(`users:${base.buyerMobile}`, true);
+      if (buyerRow) {
+        buyerRow.bought = (buyerRow.bought || 0) + 1;
+        await storageSet(`users:${buyerRow.mobile}`, buyerRow, true);
+      }
     }
     showToast("Both sides confirmed — deal complete!");
     setShowSupportQr(true);
+  }
+
+  // The buyer is asked to rate the seller once the deal is complete, whoever confirmed last
+  useEffect(() => {
+    if (local.status !== "sold" || !isBuyer || ratingDone || !sellerUser) return;
+    const already = (sellerUser.ratings || []).some((r) => r.from === user.mobile && r.itemId === local.id);
+    if (!already) setShowRating(true);
+  }, [local.status, isBuyer, ratingDone, sellerUser, local.id, user.mobile]);
+
+  if (editing) {
+    return (
+      <AddItemForm
+        user={user}
+        initial={local}
+        onCancel={() => setEditing(false)}
+        onSaved={async (updated) => {
+          setLocal(updated);
+          await persistItem(updated);
+          setEditing(false);
+          showToast("Listing updated.");
+        }}
+      />
+    );
   }
 
   return (
@@ -1302,6 +1463,12 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
           <Check size={14} style={{ marginRight: 6 }} />
           Deal complete. Item marked sold.
         </div>
+      )}
+
+      {isOwner && local.status === "active" && !local.buyerMobile && (
+        <button style={S.ghostBtn} onClick={openEdit}>
+          Edit this listing
+        </button>
       )}
 
       {!isOwner && local.status === "active" && !local.buyerMobile && (
@@ -1350,13 +1517,7 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
         </div>
       )}
 
-      {isOwner && !local.buyerMobile && (
-        <div style={S.emptyState}>
-          No buyer yet. Students from your college and district can see this listing, and chat opens here once someone reserves it.
-        </div>
-      )}
-
-      {((isBuyer && !isOwner) || (isOwner && local.buyerMobile && local.buyerMobile !== user.mobile)) && (
+      {((local.buyerMobile === user.mobile && !isOwner) || (isOwner && local.buyerMobile && local.buyerMobile !== user.mobile)) && (
         <div style={S.chatBox}>
           <div style={S.chatHeader}>
             <MessageCircle size={14} style={{ marginRight: 6 }} />
@@ -1416,37 +1577,15 @@ function ItemDetail({ item, user, allItems, onBack, persistItem, persistUser, sh
 
 /* ---------------- My items tab ---------------- */
 
-function MyItemsTab({ user, items, allItems, persistItem, persistUser, showToast, submitReport, onDelete }) {
-  const [openId, setOpenId] = useState(null);
-  const current = openId ? items.find((i) => i.id === openId) : null;
-
-  if (current && current.status === "active") {
-    return (
-      <AddItemForm
-        user={user}
-        existing={current}
-        onCancel={() => setOpenId(null)}
-        onSaved={async (item) => {
-          await persistItem(item);
-          showToast("Changes saved.");
-          setOpenId(null);
-        }}
-        onDelete={async (item) => {
-          const ok = await onDelete(item);
-          if (ok) setOpenId(null);
-        }}
-      />
-    );
-  }
-
-  if (current) {
-    // reserved or sold: no editing (a buyer is already involved), show the deal/chat instead
+function MyItemsTab({ user, items, allItems, view, setView, persistItem, persistUser, showToast, submitReport }) {
+  if (view.name === "detail") {
+    const item = items.find((i) => i.id === view.id) || view.item;
     return (
       <ItemDetail
-        item={current}
+        item={item}
         user={user}
         allItems={allItems}
-        onBack={() => setOpenId(null)}
+        onBack={() => setView({ name: "list" })}
         persistItem={persistItem}
         persistUser={persistUser}
         showToast={showToast}
@@ -1454,20 +1593,18 @@ function MyItemsTab({ user, items, allItems, persistItem, persistUser, showToast
       />
     );
   }
-
   return (
     <div>
       <div style={S.sectionTitle}>My listings</div>
       {items.length === 0 && (
         <div style={S.emptyState}>You haven't listed anything yet.</div>
       )}
-      {items.length > 0 && (
-        <div style={{ fontSize: 12.5, color: "#9AA6C0", marginBottom: 8 }}>
-          Tap a listing to edit it. Once someone reserves it, it opens as a deal instead.
-        </div>
-      )}
       {items.map((item) => (
-        <ItemCard key={item.id} item={item} onClick={() => setOpenId(item.id)} />
+        <ItemCard
+          key={item.id}
+          item={item}
+          onClick={() => setView({ name: "detail", id: item.id, item })}
+        />
       ))}
     </div>
   );
@@ -1512,8 +1649,6 @@ function ChatsTab({ user, items, view, setView, persistItem, persistUser, showTo
     .filter(
       (i) =>
         (i.sellerMobile === user.mobile || i.buyerMobile === user.mobile) &&
-        i.buyerMobile &&
-        i.buyerMobile !== i.sellerMobile &&
         i.chat &&
         i.chat.length > 0
     )
@@ -1677,7 +1812,7 @@ function SupportQrModal({ onClose }) {
   );
 }
 
-function AccountTab({ user, persistUser, items, persistItem, promoteToAdmin, showToast, onLogout }) {
+function AccountTab({ user, persistUser, items, persistItem, deleteItem, promoteToAdmin, showToast, onLogout }) {
   const [upi, setUpi] = useState(user.upi || "");
   const [viewingAdmin, setViewingAdmin] = useState(false);
   const [adminSubTab, setAdminSubTab] = useState("admin"); // 'admin' | 'items'
@@ -1744,6 +1879,7 @@ function AccountTab({ user, persistUser, items, persistItem, promoteToAdmin, sho
               <AdminPanel
                 items={items}
                 persistItem={persistItem}
+                deleteItem={deleteItem}
                 promoteToAdmin={promoteToAdmin}
                 showToast={showToast}
               />
@@ -1781,7 +1917,7 @@ function AccountTab({ user, persistUser, items, persistItem, promoteToAdmin, sho
 
 /* ---------------- Admin panel ---------------- */
 
-function AdminPanel({ items, persistItem, promoteToAdmin, showToast }) {
+function AdminPanel({ items, persistItem, deleteItem, promoteToAdmin, showToast }) {
   const [newAdminMobile, setNewAdminMobile] = useState("");
   const [reports, setReports] = useState([]);
   const [loadingReports, setLoadingReports] = useState(true);
@@ -1815,6 +1951,8 @@ function AdminPanel({ items, persistItem, promoteToAdmin, showToast }) {
       <AdminListingsBrowser
         items={items}
         persistItem={persistItem}
+        deleteItem={deleteItem}
+        showToast={showToast}
         onBack={() => setBrowsingListings(false)}
       />
     );
@@ -1890,14 +2028,94 @@ function AdminPanel({ items, persistItem, promoteToAdmin, showToast }) {
 
 /* ---------------- Admin listings browser (filter by college/district/state/item) ---------------- */
 
-function AdminListingsBrowser({ items, persistItem, onBack }) {
+function AdminListingsBrowser({ items, persistItem, deleteItem, showToast, onBack }) {
   const [college, setCollege] = useState("");
   const [district, setDistrict] = useState("");
   const [state, setStateField] = useState("");
   const [itemName, setItemName] = useState("");
 
+  const [reviewId, setReviewId] = useState(null);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+
   async function toggleBlock(item) {
-    await persistItem({ ...item, blocked: !item.blocked });
+    await persistItem({ ...item, blocked: !item.blocked }, { blocked: !item.blocked });
+  }
+
+  async function removeListing(item) {
+    await deleteItem(item.id);
+    setReviewId(null);
+    setConfirmRemove(false);
+    if (showToast) showToast("Listing removed.");
+  }
+
+  const reviewing = reviewId ? items.find((i) => i.id === reviewId) : null;
+  if (reviewing) {
+    const it = reviewing;
+    return (
+      <div>
+        <ScreenHeader
+          title="Review listing"
+          onBack={() => {
+            setReviewId(null);
+            setConfirmRemove(false);
+          }}
+        />
+        <div style={S.detailPhotoRow}>
+          {(it.photos && it.photos.length ? it.photos : [null]).map((ph, i) => (
+            <div key={i} style={S.detailPhoto}>
+              {ph ? <img src={ph} alt="" style={S.itemCardImg} /> : <span>{(it.category || "?")[0]}</span>}
+            </div>
+          ))}
+        </div>
+        <div style={S.itemCardName}>{it.name}</div>
+        <div style={{ ...S.itemCardMeta, marginTop: 4 }}>
+          ₹{it.price} · {it.category}
+          {it.colour ? ` · ${it.colour}` : ""}
+        </div>
+        <div style={{ ...S.itemCardMeta, marginTop: 4 }}>
+          {it.college}, {it.district}, {it.state}
+        </div>
+        <div style={{ ...S.itemCardMeta, marginTop: 4 }}>
+          Seller: {it.sellerMobile} · Status: {it.status}
+          {it.blocked ? " · blocked" : ""}
+        </div>
+        <div style={{ ...S.itemCardMeta, marginTop: 4 }}>
+          Listed: {it.createdAt ? new Date(it.createdAt).toLocaleString() : "—"}
+        </div>
+        <div style={{ ...S.noteBox, marginTop: 12, marginBottom: 14, whiteSpace: "pre-wrap" }}>
+          {it.description || "No description."}
+        </div>
+        <button
+          style={{ ...(it.blocked ? S.ghostBtn : S.dangerBtn), width: "100%", justifyContent: "center", marginBottom: 10 }}
+          onClick={() => toggleBlock(it)}
+        >
+          {it.blocked ? "Unblock this listing" : "Block (hide) this listing"}
+        </button>
+        {!confirmRemove ? (
+          <button
+            style={{ ...S.dangerBtn, width: "100%", justifyContent: "center" }}
+            onClick={() => setConfirmRemove(true)}
+          >
+            Remove this listing
+          </button>
+        ) : (
+          <div>
+            <div style={{ ...S.itemCardMeta, marginBottom: 8, color: COLORS.crimson }}>
+              This deletes the listing and its chat for good. Are you sure?
+            </div>
+            <button
+              style={{ ...S.dangerBtn, width: "100%", justifyContent: "center", marginBottom: 8 }}
+              onClick={() => removeListing(it)}
+            >
+              Yes, remove it permanently
+            </button>
+            <button style={{ ...S.ghostBtn, width: "100%", justifyContent: "center" }} onClick={() => setConfirmRemove(false)}>
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+    );
   }
 
   const filtered = items.filter((i) => {
@@ -1953,12 +2171,13 @@ function AdminListingsBrowser({ items, persistItem, onBack }) {
 
       {filtered.map((item) => (
         <div key={item.id} style={S.adminRow}>
-          <div style={{ flex: 1 }}>
+          <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => setReviewId(item.id)}>
             <div style={S.itemCardName}>{item.name}</div>
             <div style={S.itemCardMeta}>
               {item.college} · seller {item.sellerMobile} · {item.status}
               {item.blocked ? " · blocked" : ""}
             </div>
+            <div style={{ ...S.itemCardMeta, color: COLORS.accent }}>Tap to review</div>
           </div>
           <button
             style={item.blocked ? S.ghostBtn : S.dangerBtn}
@@ -2087,7 +2306,7 @@ const fontBody = "'Work Sans', -apple-system, BlinkMacSystemFont, sans-serif";
 
 const S = {
   bootWrap: {
-    minHeight: 500,
+    minHeight: "100dvh",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -2096,17 +2315,19 @@ const S = {
   },
   bootMark: { fontSize: 24, color: COLORS.ink, letterSpacing: 0.2 },
   appShell: {
-    maxWidth: 420,
+    maxWidth: 480,
+    width: "100%",
     margin: "0 auto",
     background: COLORS.bg,
-    minHeight: 600,
+    height: "100dvh",
     display: "flex",
     flexDirection: "column",
     fontFamily: fontBody,
-    border: `1px solid ${COLORS.line}`,
-    borderRadius: 18,
+    borderLeft: `1px solid ${COLORS.line}`,
+    borderRight: `1px solid ${COLORS.line}`,
     overflow: "hidden",
     position: "relative",
+    boxSizing: "border-box",
   },
   topBar: {
     display: "flex",
@@ -2140,7 +2361,14 @@ const S = {
     alignItems: "center",
     padding: 2,
   },
-  screen: { flex: 1, overflowY: "auto", padding: "16px 18px 90px" },
+  screen: {
+    flex: 1,
+    minHeight: 0,
+    overflowY: "auto",
+    overflowX: "hidden",
+    WebkitOverflowScrolling: "touch",
+    padding: "16px 16px calc(96px + env(safe-area-inset-bottom, 0px))",
+  },
   tabBar: {
     position: "absolute",
     bottom: 0,
@@ -2149,7 +2377,7 @@ const S = {
     display: "flex",
     background: COLORS.cardBg,
     borderTop: `1px solid ${COLORS.line}`,
-    padding: "8px 0 10px",
+    padding: "8px 0 calc(10px + env(safe-area-inset-bottom, 0px))",
   },
   tabBtn: {
     flex: 1,
@@ -2169,7 +2397,8 @@ const S = {
     marginTop: 4,
   },
   loginWrap: {
-    minHeight: 560,
+    minHeight: "100dvh",
+    boxSizing: "border-box",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
